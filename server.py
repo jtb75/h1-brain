@@ -1,9 +1,11 @@
 import asyncio
+import hmac
 import json
 import sqlite3
 import os
 from datetime import datetime, timezone
 import httpx
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -1254,17 +1256,51 @@ async def get_report_thread(report_id: str) -> str:
     return "\n".join(L)
 
 
+class BearerAuth:
+    """Reject HTTP requests whose Authorization header is not 'Bearer <token>'."""
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            supplied = dict(scope.get("headers") or []).get(b"authorization", b"")
+            if not hmac.compare_digest(supplied, self.expected):
+                body = b'{"error":"unauthorized"}'
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"www-authenticate", b"Bearer"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
 if __name__ == "__main__":
     # Default is stdio for local Claude Desktop / Claude Code. The container sets
     # MCP_TRANSPORT=streamable-http and serves on MCP_PORT.
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport == "streamable-http":
-        mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
-        mcp.settings.port = int(os.environ.get("MCP_PORT", "8000"))
+        host = os.environ.get("MCP_HOST", "0.0.0.0")
+        port = int(os.environ.get("MCP_PORT", "8000"))
+        token = os.environ.get("MCP_BEARER_TOKEN", "")
+        if not token:
+            # Fail closed: the HTTP endpoint returns personal report data.
+            raise SystemExit("MCP_BEARER_TOKEN must be set when MCP_TRANSPORT=streamable-http")
         allowed_hosts = [h for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h]
         if allowed_hosts:
             mcp.settings.transport_security = TransportSecuritySettings(
                 enable_dns_rebinding_protection=True,
                 allowed_hosts=allowed_hosts,
             )
-    mcp.run(transport=transport)
+        app = mcp.streamable_http_app()
+        app.add_middleware(BearerAuth, token=token)
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    else:
+        mcp.run(transport=transport)
