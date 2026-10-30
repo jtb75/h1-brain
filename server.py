@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 import os
+from datetime import datetime, timezone
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -94,6 +95,11 @@ def _init_db():
             created_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_activities_report ON activities(report_id);
+        CREATE TABLE IF NOT EXISTS program_policies (
+            handle TEXT PRIMARY KEY,
+            policy TEXT,
+            fetched_at TEXT
+        );
 
     """)
     conn.commit()
@@ -518,6 +524,33 @@ async def fetch_program_scopes(handle: str) -> str:
     conn.close()
 
     return f"Fetched and stored {len(rows)} scopes for '{handle}'."
+
+
+@mcp.tool()
+async def fetch_program_policy(handle: str) -> str:
+    """Fetch a program's policy (rules of engagement) from the API and store it. hack() includes it in the briefing.
+
+    Args:
+        handle: The program handle
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await _api_get(client, f"/hackers/programs/{handle}")
+    body = resp.json()
+    # The program detail endpoint returns the resource unwrapped; accept either shape.
+    attrs = (body.get("data") or body).get("attributes", {})
+    policy = attrs.get("policy") or ""
+
+    conn = _get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO program_policies VALUES (?,?,?)",
+        (handle, policy, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+    if not policy:
+        return f"No policy text published for '{handle}'."
+    return f"# Policy: {handle}\n\n{policy}"
 
 
 # --- Search tools ---
@@ -1073,6 +1106,18 @@ async def hack(handle: str) -> str:
             lines.append("### Weakness patterns from public disclosures")
             for name, cnt in sorted(disclosed_weakness_counts.items(), key=lambda x: -x[1])[:10]:
                 lines.append(f"- {name}: {cnt}x")
+
+    # 11. Program policy (rules of engagement), if fetch_program_policy has stored it
+    conn3 = _get_db()
+    policy_row = conn3.execute("SELECT policy, fetched_at FROM program_policies WHERE handle = ?", (handle,)).fetchone()
+    conn3.close()
+    if policy_row and policy_row["policy"]:
+        lines.append("")
+        lines.append(f"## Program Policy (rules of engagement, fetched {policy_row['fetched_at']})")
+        lines.append(policy_row["policy"])
+    else:
+        lines.append("")
+        lines.append(f"## Program Policy\nNot fetched yet. Run fetch_program_policy('{handle}') before any active testing.")
 
     instructions_path = os.path.join(_DIR, "hack_instructions.md")
     with open(instructions_path, "r") as f:
