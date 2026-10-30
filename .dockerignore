@@ -1,0 +1,13 @@
+.git
+.github
+venv/
+__pycache__/
+*.pyc
+.env
+h1_data.db
+h1_data.db-*
+h1_data.json
+h1_data.json.bak
+disclosed_reports.db-*
+demo.gif
+README.md

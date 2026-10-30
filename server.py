@@ -4,6 +4,7 @@ import sqlite3
 import os
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 # HackerOne API credentials (Basic Auth: username + token)
 H1_USERNAME = os.environ["H1_USERNAME"]
@@ -11,9 +12,12 @@ H1_API_TOKEN = os.environ["H1_API_TOKEN"]
 H1_BASE_URL = "https://api.hackerone.com/v1"
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(_DIR, "h1_data.db")
+# Personal data (your reports, programs, scopes) lives in DATA_DIR so a container can
+# mount it as a persistent volume. The shipped disclosed-reports DB stays in the app dir.
+DATA_DIR = os.environ.get("H1_DATA_DIR", _DIR)
+DB_FILE = os.path.join(DATA_DIR, "h1_data.db")
 DISCLOSED_DB_FILE = os.path.join(_DIR, "disclosed_reports.db")
-JSON_FILE = os.path.join(_DIR, "h1_data.json")
+JSON_FILE = os.path.join(DATA_DIR, "h1_data.json")
 
 mcp = FastMCP("h1-brain")
 
@@ -403,6 +407,66 @@ async def fetch_rewarded_reports() -> str:
 
     total_earned = sum(r[11] for r in rows)
     return f"Fetched and stored {len(rows)} rewarded reports (out of {len(all_reports)} total). Total bounties: ${total_earned:,.2f}"
+
+
+@mcp.tool()
+async def list_my_reports(state: str = "", program: str = "", limit: int = 100) -> str:
+    """List ALL your HackerOne reports across programs and states, with live status from the API.
+    Refreshes the status fields in the local DB (write-ups already stored are kept).
+
+    Args:
+        state: Filter by state (e.g. 'new', 'triaged', 'resolved', 'informative', 'duplicate', 'not-applicable')
+        program: Filter by program handle
+        limit: Max rows to list (default 100)
+    """
+    listed = await _fetch_all_pages("/hackers/me/reports")
+
+    upsert_rows = []
+    for r in listed:
+        attrs = r.get("attributes", {})
+        weak_name, weak_cwe = _extract_weakness(r)
+        upsert_rows.append((
+            r["id"], attrs.get("title"), attrs.get("state"), attrs.get("created_at"),
+            attrs.get("bounty_awarded_at"), attrs.get("closed_at"),
+            _extract_program_handle(r), weak_name, weak_cwe,
+        ))
+    conn = _get_db()
+    # Upsert status fields only, so vulnerability_information stored by fetch_program_reports survives.
+    conn.executemany("""
+        INSERT INTO reports (id, title, state, created_at, bounty_awarded_at, closed_at,
+                             program_handle, weakness_name, weakness_cwe)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+            title=excluded.title, state=excluded.state, created_at=excluded.created_at,
+            bounty_awarded_at=excluded.bounty_awarded_at, closed_at=excluded.closed_at,
+            program_handle=excluded.program_handle, weakness_name=excluded.weakness_name,
+            weakness_cwe=excluded.weakness_cwe
+    """, upsert_rows)
+    conn.commit()
+    conn.close()
+
+    def attr(r, key):
+        return r.get("attributes", {}).get(key) or ""
+
+    state_counts: dict[str, int] = {}
+    for r in listed:
+        state_counts[attr(r, "state")] = state_counts.get(attr(r, "state"), 0) + 1
+
+    shown = [
+        r for r in listed
+        if (not state or attr(r, "state") == state.lower())
+        and (not program or (_extract_program_handle(r) or "").lower() == program.lower())
+    ]
+    shown.sort(key=lambda r: attr(r, "created_at"), reverse=True)
+
+    states_str = ", ".join(f"{k}: {v}" for k, v in sorted(state_counts.items()))
+    lines = [f"{len(listed)} reports total ({states_str}). Showing {min(len(shown), limit)} of {len(shown)} matching.", ""]
+    for r in shown[:limit]:
+        lines.append(
+            f"- **#{r['id']}** [{attr(r, 'state')}] {attr(r, 'title')} — "
+            f"{_extract_program_handle(r) or '?'} — created {attr(r, 'created_at')[:10]}"
+        )
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -1146,4 +1210,16 @@ async def get_report_thread(report_id: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # Default is stdio for local Claude Desktop / Claude Code. The container sets
+    # MCP_TRANSPORT=streamable-http and serves on MCP_PORT.
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
+        mcp.settings.port = int(os.environ.get("MCP_PORT", "8000"))
+        allowed_hosts = [h for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h]
+        if allowed_hosts:
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=allowed_hosts,
+            )
+    mcp.run(transport=transport)
